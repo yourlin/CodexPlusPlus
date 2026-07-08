@@ -1096,6 +1096,7 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
+            bedrock: None,
         }],
         active_relay_id: "relay-chat".to_string(),
         ..BackendSettings::default()

@@ -100,6 +100,7 @@ pub fn relay_profile_from_ccs(
         model_list: String::new(),
         model_windows: String::new(),
         user_agent: String::new(),
+        bedrock: None,
     }
 }
 

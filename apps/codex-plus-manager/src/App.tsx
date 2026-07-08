@@ -54,6 +54,7 @@ import {
 } from "lucide-react";
 import { ProviderPresetSelector } from "@/components/ProviderPresetSelector";
 import type { PresetPatch } from "@/components/ProviderPresetSelector";
+import { BedrockRelayProfileEditor } from "@/components/BedrockRelayProfileEditor";
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 
 import { Badge as UiBadge } from "@/components/ui/badge";
@@ -68,6 +69,8 @@ import {
   serializeModelWindowRows,
   type ModelWindowRow,
 } from "./model-windows";
+import type { BedrockConfig } from "./bedrock-config";
+import { isBedrockRelayProfile, bedrockAllowsProviderTesting, resolveBedrockAfterDerive, bedrockValidationError } from "./bedrock-config";
 import { getLanguage, t, tf, toggleLanguage } from "@/i18n";
 
 type Status = "ok" | "failed" | "not_implemented" | "not_checked" | string;
@@ -210,6 +213,7 @@ export type RelayProfile = {
   modelWindows: string;
   userAgent: string;
   aggregate?: RelayAggregateConfig | null;
+  bedrock?: BedrockConfig | null;
 };
 
 type RelayAggregateStrategy = "failover" | "conversationRoundRobin" | "requestRoundRobin" | "weightedRoundRobin";
@@ -3762,14 +3766,20 @@ function SortableRelayProfileCard({
         </Button>
         <span className="relay-card-extra">
           <Button
-            disabled={isAggregateRelayProfile(profile)}
+            disabled={isAggregateRelayProfile(profile) || !bedrockAllowsProviderTesting(profile)}
             onClick={(event) => {
               event.stopPropagation();
-              if (isAggregateRelayProfile(profile)) return;
+              if (isAggregateRelayProfile(profile) || !bedrockAllowsProviderTesting(profile)) return;
               void actions.testRelayProfile(profile);
             }}
             size="icon"
-            title={isAggregateRelayProfile(profile) ? t("聚合供应商会在真实对话中轮转成员，请测试成员供应商") : t("发送 hi 测试")}
+            title={
+              isAggregateRelayProfile(profile)
+                ? t("聚合供应商会在真实对话中轮转成员，请测试成员供应商")
+                : !bedrockAllowsProviderTesting(profile)
+                  ? t("AWS Profile 模式下无法在此测试供应商；请在 Codex 会话中验证")
+                  : t("发送 hi 测试")
+            }
             variant="ghost"
           >
             <TestTube className="h-4 w-4" />
@@ -3888,7 +3898,11 @@ function RelayProfileDetail({
     setDraft(nextDraft);
     setModelWindowRows(modelWindowRowsFromProfile(nextDraft.modelList, nextDraft.modelWindows || ""));
   }, [profile.id, profile.modelList, profile.modelWindows, profileUsesLiveFiles, isActive, isNew, relayFiles?.configContents, relayFiles?.authContents]);
-  const validationError = isAggregateRelayProfile(draft) ? aggregateRelayProfileValidation(draft) : null;
+  const validationError = isAggregateRelayProfile(draft)
+    ? aggregateRelayProfileValidation(draft)
+    : isBedrockRelayProfile(draft)
+      ? bedrockValidationError(draft.bedrock!, draft.apiKey)
+      : null;
   const draftWithModelRows = () => {
     const serializedRows = serializeModelWindowRows(modelWindowRows);
     return { ...draft, modelList: serializedRows.modelList, modelWindows: serializedRows.modelWindows };
@@ -4016,6 +4030,18 @@ function RelayProfileEditor({
       />
     );
   }
+  if (isBedrockRelayProfile(profile)) {
+    return (
+      // 沿用通用 relay 编辑器的卡片外壳（border/border-radius/margin/padding/动画），
+      // 保证 Bedrock 编辑器和其它编辑器视觉一致，避免直接贴到父容器边缘。
+      <div className="relay-profile-editor">
+        <BedrockRelayProfileEditor
+          profile={profile}
+          onChange={(patch) => onProfileChange(applyRelayProfilePatchToFiles(profile, patch, { allowGenerateFiles: isNew }))}
+        />
+      </div>
+    );
+  }
 
   const showApiFields = profile.relayMode !== "official" || profile.officialMixApiKey;
   const updateDraft = (patch: Partial<RelayProfile>) => {
@@ -4070,6 +4096,26 @@ function RelayProfileEditor({
         <ProviderPresetSelector
           onSelect={(patch: PresetPatch) => {
             updateDraft(patch as unknown as Partial<RelayProfile>);
+          }}
+          onSelectBedrock={() => {
+            // 「直连 AWS Bedrock」的最常见路径是 AWS Profile (SSO)，因此默认预填
+            // authMode=awsProfile + awsProfile=default。region 默认 us-east-2 是
+            // 因为 Bedrock Mantle 的 GPT-5.5 目前仅在 us-east-2 独家开放（见文档 §A）。
+            // 模型默认 openai.gpt-5.5——Bedrock Mantle 的 /v1/responses endpoint
+            // 只暴露 GPT-5.x 系列（openai.gpt-5.5 / openai.gpt-5.4）；gpt-oss 等
+            // Bedrock native 模型 ID 走 Mantle 会 404（模型不存在），需要走 LiteLLM 中转。
+            updateDraft({
+              relayMode: "pureApi",
+              model: "openai.gpt-5.5",
+              bedrock: {
+                authMode: "awsProfile",
+                providerId: "",
+                region: "us-east-2",
+                awsProfile: "default",
+                iamUserName: "",
+                iamKeyValidityDays: "90",
+              },
+            });
           }}
         />
       ) : null}
@@ -6306,6 +6352,9 @@ function deriveRelayProfileFromFiles(profile: RelayProfile): RelayProfile {
     autoCompactLimit: codexTopLevelIntFromConfig(configContents, "model_auto_compact_token_limit"),
     configContents,
     authContents,
+    // 磁盘 config 有 Bedrock 特征时以推导结果为准；否则保留 profile 上已有的 bedrock，
+    // 避免 UI 中间态（例如刚点「Amazon Bedrock」按钮但 config 还是通用 custom 模板）被吞掉。
+    bedrock: resolveBedrockAfterDerive(profile.bedrock, configContents),
   };
 }
 
