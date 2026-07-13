@@ -1,4 +1,6 @@
 (() => {
+  const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
+
   function installCodexPlusFastStartup() {
     const config = window.__CODEX_PLUS_FAST_STARTUP__;
     if (!config || config.enabled !== true) return;
@@ -1154,7 +1156,7 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, stepwise: false };
+    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, projectMove: true, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false };
   }
 
   const codexPlusBackendSettingMap = {
@@ -1171,6 +1173,7 @@
     upstreamWorktreeCreate: "codexAppUpstreamWorktreeCreate",
     nativeMenuPlacement: "codexAppNativeMenuPlacement",
     serviceTierControls: "codexAppServiceTierControls",
+    petRealMouseLook: "codexAppPetRealMouseLook",
     stepwise: "codexAppStepwiseEnabled",
     pasteFix: "codexAppPasteFix",
   };
@@ -1205,6 +1208,7 @@
         upstreamWorktreeCreate: false,
         nativeMenuPlacement: false,
         serviceTierControls: false,
+        petRealMouseLook: false,
         stepwise: false,
       };
     }
@@ -1233,6 +1237,8 @@
         if (key === "stepwise") {
           Promise.resolve(window.__codexStepwisePanel?.loadSettings?.()).then(() => syncStepwisePanel(value));
         }
+      }).catch(() => {
+        void loadBackendSettings();
       });
       return;
     }
@@ -2439,6 +2445,10 @@
               <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮；Fast 仅支持 ${codexServiceTierFastModelListLabel()}，其他模型按 Standard 发送。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
             </div>
+            ${codexPlusIsWindowsPlatform ? `<div class="codex-plus-row">
+              <div><div class="codex-plus-row-title">桌宠跟随真实鼠标</div><div class="codex-plus-row-description">仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。</div></div>
+              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
+            </div>` : ""}
             <div class="codex-plus-row">
               <div><div class="codex-plus-row-title">Stepwise</div><div class="codex-plus-row-description">在当前 Codex 页面显示可拖动的下一步建议浮层，可在设置页配置模型和直接发送。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
@@ -4601,8 +4611,29 @@
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
     codexModelCatalogPromise = postJson("/codex-model-catalog", {})
-      .then((result) => {
+      .then(async (result) => {
         codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
+        if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
+          try {
+            const settingsPromise = postJson("/settings/get", {});
+            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("fallback timeout")), 3000));
+            const settingsResp = await Promise.race([settingsPromise, timeoutPromise]);
+            if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
+              const activeId = settingsResp.activeRelayId || "";
+              const profile = settingsResp.relayProfiles.find(p => p.id === activeId) || settingsResp.relayProfiles[0];
+              if (profile && profile.modelList) {
+                const extraModels = profile.modelList.split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+                if (extraModels.length > 0) {
+                  codexModelCatalog.models = extraModels;
+                  codexModelCatalog.default_model = codexModelCatalog.default_model || extraModels[0];
+                  sendCodexPlusDiagnostic("model_catalog_fallback_applied", { count: extraModels.length });
+                }
+              }
+            }
+          } catch (fallbackError) {
+            sendCodexPlusDiagnostic("model_catalog_fallback_error", { error: String(fallbackError?.message || fallbackError) });
+          }
+        }
         codexModelCatalogLoadedAt = Date.now();
         renderCodexPlusMenu();
         scheduleCodexModelWhitelistRefresh();
@@ -4979,8 +5010,36 @@
     return true;
   }
 
+  const appServerModelRequestPatchMaxMisses = 8;
+  let appServerModelRequestPatchMissCount = 0;
+  let appServerModelRequestPatchDisabled = false;
+
+  function noteAppServerModelRequestPatchMiss(event, detail) {
+    appServerModelRequestPatchMissCount += 1;
+    // installAppServerModelRequestPatch() runs on every model-whitelist
+    // refresh tick (~120ms). On Codex builds where the app-server module was
+    // renamed/removed (e.g. 26.623+, issue #1324) this layer never succeeds
+    // and would otherwise emit the same diagnostic on every tick forever.
+    // Report the first miss so telemetry still captures the cause, then stay
+    // quiet, and finally disable this layer once it is clearly unavailable.
+    // This is a graceful fallback: the remaining whitelist layers (Statsig
+    // config / React state / response JSON patch) keep injecting the custom
+    // models on their own.
+    if (appServerModelRequestPatchMissCount === 1) {
+      sendCodexPlusDiagnostic(event, detail);
+    }
+    if (appServerModelRequestPatchMissCount >= appServerModelRequestPatchMaxMisses && !appServerModelRequestPatchDisabled) {
+      appServerModelRequestPatchDisabled = true;
+      sendCodexPlusDiagnostic("model_app_server_request_patch_skipped", {
+        misses: appServerModelRequestPatchMissCount,
+        lastEvent: event,
+      });
+    }
+  }
+
   function installAppServerModelRequestPatch() {
     if (window.__codexPlusAppServerModelRequestPatchInstalled === codexAppServerModelRequestPatchVersion) return;
+    if (appServerModelRequestPatchDisabled) return;
     const patch = async () => {
       try {
         const module = await loadCodexAppModule("app-server-manager-signals-");
@@ -4996,19 +5055,20 @@
           }
         }
         if (patchedCount > 0) {
+          appServerModelRequestPatchMissCount = 0;
           window.__codexPlusAppServerModelRequestPatchInstalled = codexAppServerModelRequestPatchVersion;
           sendCodexPlusDiagnostic("model_app_server_request_patch_installed", {
             candidateCount: candidates.length,
             patchedCount,
           });
         } else {
-          sendCodexPlusDiagnostic("model_app_server_request_patch_not_found", {
+          noteAppServerModelRequestPatchMiss("model_app_server_request_patch_not_found", {
             exportCount: Object.keys(module || {}).length,
             candidateCount: candidates.length,
           });
         }
       } catch (error) {
-        sendCodexPlusDiagnostic("model_app_server_request_patch_failed", {
+        noteAppServerModelRequestPatchMiss("model_app_server_request_patch_failed", {
           errorName: error?.name || "",
           errorMessage: error?.message || String(error),
         });
