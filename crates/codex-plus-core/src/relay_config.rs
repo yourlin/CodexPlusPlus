@@ -215,15 +215,50 @@ pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
         .and_then(|values| values.get("base_url"))
         .map(|value| !unquote_toml_string(value).trim().is_empty())
         .unwrap_or(false);
+
+    // OpenAI 兼容型 provider（`requires_openai_auth = true` + `base_url` + Bearer/API Key）
+    // 走严格路径；不满足这些字段的原生 provider（例如仅提供 `[model_providers.<id>.<sub>]`
+    // 子表的 Amazon Bedrock AWS Profile 形态）仍应被视为 "已配置"。
+    // 这里通过通用的表段存在性判定兜底，避免 relay_switch 里针对某个供应商做特判。
+    let openai_compat_configured = root_provider.is_some()
+        && requires_openai_auth
+        && (has_bearer_token || codex_auth_api_key(&auth_contents).is_some())
+        && has_base_url;
+    let native_provider_configured = root_provider
+        .as_ref()
+        .map(|provider| has_model_provider_section(&contents, provider))
+        .unwrap_or(false);
+
     RelayConfigStatus {
-        configured: root_provider.is_some()
-            && requires_openai_auth
-            && (has_bearer_token || codex_auth_api_key(&auth_contents).is_some())
-            && has_base_url,
+        configured: openai_compat_configured || native_provider_configured,
         requires_openai_auth,
         has_bearer_token,
         config_path: config_path.to_string_lossy().to_string(),
     }
+}
+
+/// 判断 config.toml 里是否存在与指定 `provider` 关联的 `[model_providers.<provider>]`
+/// 表段，或任何以 `[model_providers.<provider>.` 开头的子表段。
+///
+/// 这个通用检查用于识别不走 OpenAI 兼容形状的原生 provider（例如 Amazon Bedrock
+/// 的 AWS Profile 模式只提供 `[model_providers.amazon-bedrock.aws]` 子表段）；调
+/// 用方无需关心具体供应商即可判定 "config 是否已完成写入"。
+fn has_model_provider_section(contents: &str, provider: &str) -> bool {
+    let exact_header = format!("[model_providers.{provider}]");
+    let child_prefix = format!("[model_providers.{provider}.");
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+            continue;
+        }
+        if trimmed == exact_header {
+            return true;
+        }
+        if trimmed.starts_with(&child_prefix) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn apply_relay_config_to_home(
